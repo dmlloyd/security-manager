@@ -44,6 +44,8 @@ import java.util.concurrent.atomic.AtomicLongFieldUpdater;
 import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
 
 import org.kohsuke.MetaInfServices;
+import org.wildfly.security.ParametricPrivilegedAction;
+import org.wildfly.security.ParametricPrivilegedExceptionAction;
 import org.wildfly.security.manager.action.ClearPropertyAction;
 import org.wildfly.security.manager.action.GetClassLoaderAction;
 import org.wildfly.security.manager.action.GetContextClassLoaderAction;
@@ -56,8 +58,6 @@ import org.wildfly.security.manager.action.SetContextClassLoaderAction;
 import org.wildfly.security.manager.action.WritePropertyAction;
 import sun.reflect.Reflection;
 
-import static java.lang.Boolean.FALSE;
-import static java.lang.Boolean.TRUE;
 import static java.lang.System.clearProperty;
 import static java.lang.System.getProperties;
 import static java.lang.System.getProperty;
@@ -84,13 +84,19 @@ public final class WildFlySecurityManager extends SecurityManager {
     private static final Permission GET_CLASS_LOADER_PERMISSION = new RuntimePermission("getClassLoader");
     private static final Permission SET_CLASS_LOADER_PERMISSION = new RuntimePermission("setClassLoader");
 
-    private static final InheritableThreadLocal<Boolean> CHECKING = new InheritableThreadLocal<Boolean>() {
-        protected Boolean initialValue() {
-            return Boolean.TRUE;
+    static class Context {
+        boolean checking = true;
+        boolean entered = false;
+        ParametricPrivilegedAction<Object, Object> action1;
+        ParametricPrivilegedExceptionAction<Object, Object> action2;
+        Object parameter;
+    }
+
+    private static final ThreadLocal<Context> CTX = new ThreadLocal<Context>() {
+        protected Context initialValue() {
+            return new Context();
         }
     };
-
-    private static final ThreadLocal<Boolean> ENTERED = new ThreadLocal<Boolean>();
 
     private static final Field PD_STACK;
     private static final WildFlySecurityManager INSTANCE;
@@ -107,7 +113,9 @@ public final class WildFlySecurityManager extends SecurityManager {
         boolean result = false;
         int offset = 0;
         try {
+            //noinspection deprecation
             result = Reflection.getCallerClass(1) == WildFlySecurityManager.class || Reflection.getCallerClass(2) == WildFlySecurityManager.class;
+            //noinspection deprecation
             offset = Reflection.getCallerClass(1) == Reflection.class ? 2 : 1;
 
         } catch (Throwable ignored) {}
@@ -125,6 +133,7 @@ public final class WildFlySecurityManager extends SecurityManager {
     public WildFlySecurityManager() throws SecurityException {
     }
 
+    @SuppressWarnings("deprecation")
     static Class<?> getCallerClass(int n) {
         if (hasGetCallerClass) {
             return Reflection.getCallerClass(n + callerOffset);
@@ -144,7 +153,7 @@ public final class WildFlySecurityManager extends SecurityManager {
      */
     public static boolean isChecking() {
         final SecurityManager sm = getSecurityManager();
-        return sm instanceof WildFlySecurityManager ? CHECKING.get() == TRUE : sm != null;
+        return sm instanceof WildFlySecurityManager ? CTX.get().checking : sm != null;
     }
 
     /**
@@ -200,8 +209,9 @@ public final class WildFlySecurityManager extends SecurityManager {
     public static boolean tryCheckPermission(final Permission permission, final ProtectionDomain... domains) {
         final ProtectionDomain protectionDomain = findAccessDenial(permission, domains);
         if (protectionDomain != null) {
-            if (ENTERED.get() != TRUE) {
-                ENTERED.set(TRUE);
+            final Context ctx = CTX.get();
+            if (! ctx.entered) {
+                ctx.entered = true;
                 try {
                     final CodeSource codeSource = protectionDomain.getCodeSource();
                     final ClassLoader classLoader = protectionDomain.getClassLoader();
@@ -212,7 +222,7 @@ public final class WildFlySecurityManager extends SecurityManager {
                         access.accessCheckFailed(permission, codeSource, classLoader, Arrays.toString(principals));
                     }
                 } finally {
-                    ENTERED.set(FALSE);
+                    ctx.entered = true;
                 }
             }
             return false;
@@ -231,19 +241,15 @@ public final class WildFlySecurityManager extends SecurityManager {
         if (perm.implies(SECURITY_MANAGER_PERMISSION)) {
             throw access.secMgrChange();
         }
-        if (CHECKING.get() == TRUE) {
-            if (ENTERED.get() == TRUE) {
+        final Context ctx = CTX.get();
+        if (ctx.checking) {
+            if (ctx.entered) {
                 return;
             }
-            ENTERED.set(TRUE);
+            final ProtectionDomain[] stack;
+            ctx.entered = true;
             try {
-                final ProtectionDomain[] stack;
-                try {
-                    stack = (ProtectionDomain[]) PD_STACK.get(context);
-                } catch (IllegalAccessException e) {
-                    // should be impossible
-                    throw new IllegalAccessError(e.getMessage());
-                }
+                stack = getProtectionDomainStack(context);
                 if (stack != null) {
                     final ProtectionDomain deniedDomain = findAccessDenial(perm, stack);
                     if (deniedDomain != null) {
@@ -253,152 +259,163 @@ public final class WildFlySecurityManager extends SecurityManager {
                     }
                 }
             } finally {
-                ENTERED.set(FALSE);
+                ctx.entered = false;
             }
         }
     }
 
+    private static ProtectionDomain[] getProtectionDomainStack(final AccessControlContext context) {
+        final ProtectionDomain[] stack;
+        try {
+            stack = (ProtectionDomain[]) PD_STACK.get(context);
+        } catch (IllegalAccessException e) {
+            // should be impossible
+            throw new IllegalAccessError(e.getMessage());
+        }
+        return stack;
+    }
+
     public void checkCreateClassLoader() {
-        if (CHECKING.get() == TRUE) {
+        if (CTX.get().checking) {
             super.checkCreateClassLoader();
         }
     }
 
     public void checkAccess(final Thread t) {
-        if (CHECKING.get() == TRUE) {
+        if (CTX.get().checking) {
             super.checkAccess(t);
         }
     }
 
     public void checkAccess(final ThreadGroup g) {
-        if (CHECKING.get() == TRUE) {
+        if (CTX.get().checking) {
             super.checkAccess(g);
         }
     }
 
     public void checkExit(final int status) {
-        if (CHECKING.get() == TRUE) {
+        if (CTX.get().checking) {
             super.checkExit(status);
         }
     }
 
     public void checkExec(final String cmd) {
-        if (CHECKING.get() == TRUE) {
+        if (CTX.get().checking) {
             super.checkExec(cmd);
         }
     }
 
     public void checkLink(final String lib) {
-        if (CHECKING.get() == TRUE) {
+        if (CTX.get().checking) {
             super.checkLink(lib);
         }
     }
 
     public void checkRead(final FileDescriptor fd) {
-        if (CHECKING.get() == TRUE) {
+        if (CTX.get().checking) {
             super.checkRead(fd);
         }
     }
 
     public void checkRead(final String file) {
-        if (CHECKING.get() == TRUE) {
+        if (CTX.get().checking) {
             super.checkRead(file);
         }
     }
 
     public void checkRead(final String file, final Object context) {
-        if (CHECKING.get() == TRUE) {
+        if (CTX.get().checking) {
             super.checkRead(file, context);
         }
     }
 
     public void checkWrite(final FileDescriptor fd) {
-        if (CHECKING.get() == TRUE) {
+        if (CTX.get().checking) {
             super.checkWrite(fd);
         }
     }
 
     public void checkWrite(final String file) {
-        if (CHECKING.get() == TRUE) {
+        if (CTX.get().checking) {
             super.checkWrite(file);
         }
     }
 
     public void checkDelete(final String file) {
-        if (CHECKING.get() == TRUE) {
+        if (CTX.get().checking) {
             super.checkDelete(file);
         }
     }
 
     public void checkConnect(final String host, final int port) {
-        if (CHECKING.get() == TRUE) {
+        if (CTX.get().checking) {
             super.checkConnect(host, port);
         }
     }
 
     public void checkConnect(final String host, final int port, final Object context) {
-        if (CHECKING.get() == TRUE) {
+        if (CTX.get().checking) {
             super.checkConnect(host, port, context);
         }
     }
 
     public void checkListen(final int port) {
-        if (CHECKING.get() == TRUE) {
+        if (CTX.get().checking) {
             super.checkListen(port);
         }
     }
 
     public void checkAccept(final String host, final int port) {
-        if (CHECKING.get() == TRUE) {
+        if (CTX.get().checking) {
             super.checkAccept(host, port);
         }
     }
 
     public void checkMulticast(final InetAddress maddr) {
-        if (CHECKING.get() == TRUE) {
+        if (CTX.get().checking) {
             super.checkMulticast(maddr);
         }
     }
 
-    @Deprecated
+    @Deprecated @SuppressWarnings("deprecation")
     public void checkMulticast(final InetAddress maddr, final byte ttl) {
-        if (CHECKING.get() == TRUE) {
+        if (CTX.get().checking) {
             super.checkMulticast(maddr, ttl);
         }
     }
 
     public void checkPropertiesAccess() {
-        if (CHECKING.get() == TRUE) {
+        if (CTX.get().checking) {
             super.checkPropertiesAccess();
         }
     }
 
     public void checkPropertyAccess(final String key) {
-        if (CHECKING.get() == TRUE) {
+        if (CTX.get().checking) {
             super.checkPropertyAccess(key);
         }
     }
 
     public void checkPrintJobAccess() {
-        if (CHECKING.get() == TRUE) {
+        if (CTX.get().checking) {
             super.checkPrintJobAccess();
         }
     }
 
     public void checkPackageAccess(final String pkg) {
-        if (CHECKING.get() == TRUE) {
+        if (CTX.get().checking) {
             super.checkPackageAccess(pkg);
         }
     }
 
     public void checkPackageDefinition(final String pkg) {
-        if (CHECKING.get() == TRUE) {
+        if (CTX.get().checking) {
             super.checkPackageDefinition(pkg);
         }
     }
 
     public void checkSetFactory() {
-        if (CHECKING.get() == TRUE) {
+        if (CTX.get().checking) {
             super.checkSetFactory();
         }
     }
@@ -415,7 +432,8 @@ public final class WildFlySecurityManager extends SecurityManager {
     }
 
     public void checkMemberAccess(final Class<?> clazz, final int which) {
-        if (CHECKING.get() == TRUE && ENTERED.get() != TRUE) {
+        final Context ctx = CTX.get();
+        if (ctx.checking && ! ctx.entered) {
             if (clazz == null) {
                 throw new NullPointerException("class can't be null");
             }
@@ -441,14 +459,14 @@ public final class WildFlySecurityManager extends SecurityManager {
                     final ClassLoader classLoaderFour;
                     final ClassLoader clazzClassLoader;
                     // get class loaders without permission check
-                    ENTERED.set(TRUE);
+                    ctx.entered = true;
                     try {
                         classLoaderThree = classThree.getClassLoader();
                         objectClassLoader = Object.class.getClassLoader();
                         classLoaderFour = depth >= 5 ? context[4].getClassLoader() : null;
                         clazzClassLoader = clazz.getClassLoader();
                     } finally {
-                        ENTERED.set(FALSE);
+                        ctx.entered = false;
                     }
                     // check above assumptions
                     if (context[1] == Class.class && context[2] == Class.class) {
@@ -478,7 +496,7 @@ public final class WildFlySecurityManager extends SecurityManager {
     }
 
     public void checkSecurityAccess(final String target) {
-        if (CHECKING.get() == TRUE) {
+        if (CTX.get().checking) {
             super.checkSecurityAccess(target);
         }
     }
@@ -492,15 +510,15 @@ public final class WildFlySecurityManager extends SecurityManager {
      * @return the return value of the action
      */
     public static <T> T doChecked(PrivilegedAction<T> action) {
-        final ThreadLocal<Boolean> checking = WildFlySecurityManager.CHECKING;
-        if (checking.get() == TRUE) {
+        final Context ctx = CTX.get();
+        if (ctx.checking) {
             return action.run();
         }
-        checking.set(TRUE);
+        ctx.checking = true;
         try {
             return action.run();
         } finally {
-            checking.set(FALSE);
+            ctx.checking = false;
         }
     }
 
@@ -514,8 +532,8 @@ public final class WildFlySecurityManager extends SecurityManager {
      * @throws PrivilegedActionException if the action threw an exception
      */
     public static <T> T doChecked(PrivilegedExceptionAction<T> action) throws PrivilegedActionException {
-        final ThreadLocal<Boolean> checking = WildFlySecurityManager.CHECKING;
-        if (checking.get() == TRUE) {
+        final Context ctx = CTX.get();
+        if (ctx.checking) {
             try {
                 return action.run();
             } catch (RuntimeException e) {
@@ -524,7 +542,7 @@ public final class WildFlySecurityManager extends SecurityManager {
                 throw new PrivilegedActionException(e);
             }
         }
-        checking.set(TRUE);
+        ctx.checking = true;
         try {
             return action.run();
         } catch (RuntimeException e) {
@@ -532,7 +550,7 @@ public final class WildFlySecurityManager extends SecurityManager {
         } catch (Exception e) {
             throw new PrivilegedActionException(e);
         } finally {
-            checking.set(FALSE);
+            ctx.checking = false;
         }
     }
 
@@ -546,15 +564,15 @@ public final class WildFlySecurityManager extends SecurityManager {
      * @return the return value of the action
      */
     public static <T> T doChecked(PrivilegedAction<T> action, AccessControlContext context) {
-        final ThreadLocal<Boolean> checking = WildFlySecurityManager.CHECKING;
-        if (checking.get() == TRUE) {
+        final Context ctx = CTX.get();
+        if (ctx.checking) {
             return action.run();
         }
-        checking.set(TRUE);
+        ctx.checking = true;
         try {
             return AccessController.doPrivileged(action, context);
         } finally {
-            checking.set(FALSE);
+            ctx.checking = false;
         }
     }
 
@@ -569,8 +587,8 @@ public final class WildFlySecurityManager extends SecurityManager {
      * @throws PrivilegedActionException if the action threw an exception
      */
     public static <T> T doChecked(PrivilegedExceptionAction<T> action, AccessControlContext context) throws PrivilegedActionException {
-        final ThreadLocal<Boolean> checking = WildFlySecurityManager.CHECKING;
-        if (checking.get() == TRUE) {
+        final Context ctx = CTX.get();
+        if (ctx.checking) {
             try {
                 return action.run();
             } catch (RuntimeException e) {
@@ -579,11 +597,11 @@ public final class WildFlySecurityManager extends SecurityManager {
                 throw new PrivilegedActionException(e);
             }
         }
-        checking.set(TRUE);
+        ctx.checking = true;
         try {
             return AccessController.doPrivileged(action, context);
         } finally {
-            checking.set(FALSE);
+            ctx.checking = false;
         }
     }
 
@@ -596,11 +614,11 @@ public final class WildFlySecurityManager extends SecurityManager {
      * @return the return value of the action
      */
     public static <T> T doUnchecked(PrivilegedAction<T> action) {
-        final ThreadLocal<Boolean> checking = WildFlySecurityManager.CHECKING;
-        if (checking.get() != TRUE) {
+        final Context ctx = CTX.get();
+        if (ctx.checking) {
             return action.run();
         }
-        checking.set(FALSE);
+        ctx.checking = true;
         try {
             final SecurityManager sm = getSecurityManager();
             if (sm != null) {
@@ -608,7 +626,7 @@ public final class WildFlySecurityManager extends SecurityManager {
             }
             return action.run();
         } finally {
-            checking.set(TRUE);
+            ctx.checking = false;
         }
     }
 
@@ -622,15 +640,15 @@ public final class WildFlySecurityManager extends SecurityManager {
      * @throws PrivilegedActionException if the action threw an exception
      */
     public static <T> T doUnchecked(PrivilegedExceptionAction<T> action) throws PrivilegedActionException {
-        final ThreadLocal<Boolean> checking = WildFlySecurityManager.CHECKING;
-        if (checking.get() != TRUE) {
+        final Context ctx = CTX.get();
+        if (! ctx.checking) {
             try {
                 return action.run();
             } catch (Exception e) {
                 throw new PrivilegedActionException(e);
             }
         }
-        checking.set(FALSE);
+        ctx.checking = false;
         try {
             final SecurityManager sm = getSecurityManager();
             if (sm != null) {
@@ -640,7 +658,7 @@ public final class WildFlySecurityManager extends SecurityManager {
         } catch (Exception e) {
             throw new PrivilegedActionException(e);
         } finally {
-            checking.set(TRUE);
+            ctx.checking = true;
         }
     }
 
@@ -654,11 +672,11 @@ public final class WildFlySecurityManager extends SecurityManager {
      * @return the return value of the action
      */
     public static <T> T doUnchecked(PrivilegedAction<T> action, AccessControlContext context) {
-        final ThreadLocal<Boolean> checking = WildFlySecurityManager.CHECKING;
-        if (checking.get() != TRUE) {
+        final Context ctx = CTX.get();
+        if (! ctx.checking) {
             return AccessController.doPrivileged(action, context);
         }
-        checking.set(FALSE);
+        ctx.checking = false;
         try {
             final SecurityManager sm = getSecurityManager();
             if (sm != null) {
@@ -666,7 +684,7 @@ public final class WildFlySecurityManager extends SecurityManager {
             }
             return AccessController.doPrivileged(action, context);
         } finally {
-            checking.set(TRUE);
+            ctx.checking = true;
         }
     }
 
@@ -681,11 +699,11 @@ public final class WildFlySecurityManager extends SecurityManager {
      * @throws PrivilegedActionException if the action threw an exception
      */
     public static <T> T doUnchecked(PrivilegedExceptionAction<T> action, AccessControlContext context) throws PrivilegedActionException {
-        final ThreadLocal<Boolean> checking = WildFlySecurityManager.CHECKING;
-        if (checking.get() != TRUE) {
+        final Context ctx = CTX.get();
+        if (! ctx.checking) {
             return AccessController.doPrivileged(action, context);
         }
-        checking.set(FALSE);
+        ctx.checking = false;
         try {
             final SecurityManager sm = getSecurityManager();
             if (sm != null) {
@@ -693,7 +711,7 @@ public final class WildFlySecurityManager extends SecurityManager {
             }
             return AccessController.doPrivileged(action, context);
         } finally {
-            checking.set(TRUE);
+            ctx.checking = true;
         }
     }
 
@@ -786,16 +804,16 @@ public final class WildFlySecurityManager extends SecurityManager {
             return getProperty(name, def);
         }
         if (sm instanceof WildFlySecurityManager) {
-            final ThreadLocal<Boolean> checking = WildFlySecurityManager.CHECKING;
-            if (checking.get() != TRUE) {
+            final Context ctx = CTX.get();
+            if (! ctx.checking) {
                 return getProperty(name, def);
             }
             checkPropertyReadPermission(getCallerClass(2), name);
-            checking.set(FALSE);
+            ctx.checking = false;
             try {
                 return getProperty(name, def);
             } finally {
-                checking.set(TRUE);
+                ctx.checking = true;
             }
         } else {
             checkPropertyReadPermission(getCallerClass(2), name);
@@ -820,16 +838,16 @@ public final class WildFlySecurityManager extends SecurityManager {
             return getenv(name);
         }
         if (sm instanceof WildFlySecurityManager) {
-            final ThreadLocal<Boolean> checking = WildFlySecurityManager.CHECKING;
-            if (checking.get() != TRUE) {
+            final Context ctx = CTX.get();
+            if (! ctx.checking) {
                 return def(getenv(name), def);
             }
             checkEnvPropertyReadPermission(getCallerClass(2), name);
-            checking.set(FALSE);
+            ctx.checking = false;
             try {
                 return def(getenv(name), def);
             } finally {
-                checking.set(TRUE);
+                ctx.checking = true;
             }
         } else {
             checkEnvPropertyReadPermission(getCallerClass(2), name);
@@ -850,16 +868,16 @@ public final class WildFlySecurityManager extends SecurityManager {
             return setProperty(name, value);
         }
         if (sm instanceof WildFlySecurityManager) {
-            final ThreadLocal<Boolean> checking = WildFlySecurityManager.CHECKING;
-            if (checking.get() != TRUE) {
+            final Context ctx = CTX.get();
+            if (! ctx.checking) {
                 return setProperty(name, value);
             }
             checkPropertyWritePermission(getCallerClass(2), name);
-            checking.set(FALSE);
+            ctx.checking = false;
             try {
                 return setProperty(name, value);
             } finally {
-                checking.set(TRUE);
+                ctx.checking = true;
             }
         } else {
             checkPropertyWritePermission(getCallerClass(2), name);
@@ -879,16 +897,16 @@ public final class WildFlySecurityManager extends SecurityManager {
             return clearProperty(name);
         }
         if (sm instanceof WildFlySecurityManager) {
-            final ThreadLocal<Boolean> checking = WildFlySecurityManager.CHECKING;
-            if (checking.get() != TRUE) {
+            final Context ctx = CTX.get();
+            if (! ctx.checking) {
                 return clearProperty(name);
             }
             checkPropertyWritePermission(getCallerClass(2), name);
-            checking.set(FALSE);
+            ctx.checking = false;
             try {
                 return clearProperty(name);
             } finally {
-                checking.set(TRUE);
+                ctx.checking = true;
             }
         } else {
             checkPropertyWritePermission(getCallerClass(2), name);
@@ -908,16 +926,16 @@ public final class WildFlySecurityManager extends SecurityManager {
             return currentThread().getContextClassLoader();
         }
         if (sm instanceof WildFlySecurityManager) {
-            final ThreadLocal<Boolean> checking = WildFlySecurityManager.CHECKING;
-            if (checking.get() != TRUE) {
+            final Context ctx = CTX.get();
+            if (! ctx.checking) {
                 return currentThread().getContextClassLoader();
             }
-            checking.set(FALSE);
+            ctx.checking = false;
             try {
                 checkPDPermission(getCallerClass(2), GET_CLASS_LOADER_PERMISSION);
                 return currentThread().getContextClassLoader();
             } finally {
-                checking.set(TRUE);
+                ctx.checking = true;
             }
         } else {
             checkPDPermission(getCallerClass(2), GET_CLASS_LOADER_PERMISSION);
@@ -941,13 +959,13 @@ public final class WildFlySecurityManager extends SecurityManager {
             thread.setContextClassLoader(newClassLoader);
         }
         if (sm instanceof WildFlySecurityManager) {
-            final ThreadLocal<Boolean> checking = WildFlySecurityManager.CHECKING;
-            if (checking.get() != TRUE) try {
+            final Context ctx = CTX.get();
+            if (! ctx.checking) try {
                 return thread.getContextClassLoader();
             } finally {
                 thread.setContextClassLoader(newClassLoader);
             }
-            checking.set(FALSE);
+            ctx.checking = false;
             // separate try/finally to guarantee proper exception flow
             try {
                 checkPDPermission(getCallerClass(2), SET_CLASS_LOADER_PERMISSION);
@@ -957,7 +975,7 @@ public final class WildFlySecurityManager extends SecurityManager {
                     thread.setContextClassLoader(newClassLoader);
                 }
             } finally {
-                checking.set(TRUE);
+                ctx.checking = true;
             }
         } else {
             checkPDPermission(getCallerClass(2), SET_CLASS_LOADER_PERMISSION);
@@ -981,13 +999,13 @@ public final class WildFlySecurityManager extends SecurityManager {
             thread.setContextClassLoader(clazz.getClassLoader());
         }
         if (sm instanceof WildFlySecurityManager) {
-            final ThreadLocal<Boolean> checking = WildFlySecurityManager.CHECKING;
-            if (checking.get() != TRUE) try {
+            final Context ctx = CTX.get();
+            if (! ctx.checking) try {
                 return thread.getContextClassLoader();
             } finally {
                 thread.setContextClassLoader(clazz.getClassLoader());
             }
-            checking.set(FALSE);
+            ctx.checking = false;
             // separate try/finally to guarantee proper exception flow
             try {
                 final Class<?> caller = getCallerClass(2);
@@ -999,7 +1017,7 @@ public final class WildFlySecurityManager extends SecurityManager {
                     thread.setContextClassLoader(clazz.getClassLoader());
                 }
             } finally {
-                checking.set(TRUE);
+                ctx.checking = true;
             }
         } else {
             final Class<?> caller = getCallerClass(2);
@@ -1021,16 +1039,16 @@ public final class WildFlySecurityManager extends SecurityManager {
             return getProperties();
         }
         if (sm instanceof WildFlySecurityManager) {
-            final ThreadLocal<Boolean> checking = WildFlySecurityManager.CHECKING;
-            if (checking.get() != TRUE) {
+            final Context ctx = CTX.get();
+            if (! ctx.checking) {
                 return getProperties();
             }
-            checking.set(FALSE);
+            ctx.checking = false;
             try {
                 checkPDPermission(getCallerClass(2), PROPERTIES_PERMISSION);
                 return getProperties();
             } finally {
-                checking.set(TRUE);
+                ctx.checking = true;
             }
         } else {
             checkPDPermission(getCallerClass(2), PROPERTIES_PERMISSION);
@@ -1050,16 +1068,16 @@ public final class WildFlySecurityManager extends SecurityManager {
             return getenv();
         }
         if (sm instanceof WildFlySecurityManager) {
-            final ThreadLocal<Boolean> checking = WildFlySecurityManager.CHECKING;
-            if (checking.get() != TRUE) {
+            final Context ctx = CTX.get();
+            if (! ctx.checking) {
                 return getenv();
             }
-            checking.set(FALSE);
+            ctx.checking = false;
             try {
                 checkPDPermission(getCallerClass(2), ENVIRONMENT_PERMISSION);
                 return getenv();
             } finally {
-                checking.set(TRUE);
+                ctx.checking = true;
             }
         } else {
             checkPDPermission(getCallerClass(2), ENVIRONMENT_PERMISSION);
@@ -1080,20 +1098,153 @@ public final class WildFlySecurityManager extends SecurityManager {
             return clazz.getClassLoader();
         }
         if (sm instanceof WildFlySecurityManager) {
-            final ThreadLocal<Boolean> checking = WildFlySecurityManager.CHECKING;
-            if (checking.get() != TRUE) {
+            final Context ctx = CTX.get();
+            if (! ctx.checking) {
                 return clazz.getClassLoader();
             }
-            checking.set(FALSE);
+            ctx.checking = false;
             try {
                 checkPDPermission(getCallerClass(2), GET_CLASS_LOADER_PERMISSION);
                 return clazz.getClassLoader();
             } finally {
-                checking.set(TRUE);
+                ctx.checking = true;
             }
         } else {
             checkPDPermission(getCallerClass(2), GET_CLASS_LOADER_PERMISSION);
             return doPrivileged(new GetClassLoaderAction(clazz));
         }
+    }
+
+    private static final ClassValue<AccessControlContext> ACC_CACHE = new ClassValue<AccessControlContext>() {
+        protected AccessControlContext computeValue(final Class<?> type) {
+            final Context ctx = CTX.get();
+            assert ! ctx.entered;
+            ctx.entered = true;
+            try {
+                return new AccessControlContext(new ProtectionDomain[] { type.getProtectionDomain() });
+            } finally {
+                ctx.entered = false;
+            }
+        }
+    };
+
+    private static final PrivilegedAction<Object> PA_TRAMPOLINE1 = new PrivilegedAction<Object>() {
+        public Object run() {
+            final Context ctx = CTX.get();
+            final ParametricPrivilegedAction<Object, Object> a = ctx.action1;
+            final Object p = ctx.parameter;
+            ctx.action1 = null;
+            ctx.parameter = null;
+            return a.run(p);
+        }
+    };
+
+    private static final PrivilegedExceptionAction<Object> PA_TRAMPOLINE2 = new PrivilegedExceptionAction<Object>() {
+        public Object run() throws Exception {
+            final Context ctx = CTX.get();
+            final ParametricPrivilegedExceptionAction<Object, Object> a = ctx.action2;
+            final Object p = ctx.parameter;
+            ctx.action2 = null;
+            ctx.parameter = null;
+            return a.run(p);
+        }
+    };
+
+    /**
+     * Execute a parametric privileged action with the given parameter in a privileged context.
+     *
+     * @param action the action to execute
+     * @param parameter the parameter to send in to the action
+     * @param <T> the action result type
+     * @param <P> the parameter type
+     * @return the action result
+     */
+    @SuppressWarnings("unchecked")
+    public static <T, P> T doPrivilegedWithParameter(ParametricPrivilegedAction<T, P> action, P parameter) {
+        final Context ctx = CTX.get();
+        ctx.action1 = (ParametricPrivilegedAction<Object, Object>) action;
+        ctx.parameter = parameter;
+        return (T) doPrivileged(PA_TRAMPOLINE1, ACC_CACHE.get(getCallerClass(2)));
+    }
+
+    /**
+     * Execute a parametric privileged action with the given parameter in a privileged context.
+     *
+     * @param action the action to execute
+     * @param parameter the parameter to send in to the action
+     * @param <T> the action result type
+     * @param <P> the parameter type
+     * @return the action result
+     */
+    @SuppressWarnings("unchecked")
+    public static <T, P> T doPrivilegedWithParameter(ParametricPrivilegedExceptionAction<T, P> action, P parameter) throws PrivilegedActionException {
+        final Context ctx = CTX.get();
+        ctx.action2 = (ParametricPrivilegedExceptionAction<Object, Object>) action;
+        ctx.parameter = parameter;
+        return (T) doPrivileged(PA_TRAMPOLINE2, ACC_CACHE.get(getCallerClass(2)));
+    }
+
+    /**
+     * Execute a parametric privileged action with the given parameter with the given context.
+     *
+     * @param action the action to execute
+     * @param parameter the parameter to send in to the action
+     * @param accessControlContext the context to use
+     * @param <T> the action result type
+     * @param <P> the parameter type
+     * @return the action result
+     */
+    @SuppressWarnings("unchecked")
+    public static <T, P> T doPrivilegedWithParameter(ParametricPrivilegedAction<T, P> action, P parameter, AccessControlContext accessControlContext) {
+        final Context ctx = CTX.get();
+        ctx.action1 = (ParametricPrivilegedAction<Object, Object>) action;
+        ctx.parameter = parameter;
+        ctx.entered = true;
+        final AccessControlContext combined;
+        try {
+            ProtectionDomain[] protectionDomainStack = getProtectionDomainStack(accessControlContext);
+            if (protectionDomainStack == null || protectionDomainStack.length == 0) {
+                combined = ACC_CACHE.get(getCallerClass(2));
+            } else {
+                final ProtectionDomain[] finalDomains = Arrays.copyOf(protectionDomainStack, protectionDomainStack.length + 1);
+                finalDomains[protectionDomainStack.length] = getCallerClass(2).getProtectionDomain();
+                combined = new AccessControlContext(finalDomains);
+            }
+        } finally {
+            ctx.entered = false;
+        }
+        return (T) doPrivileged(PA_TRAMPOLINE1, combined);
+    }
+
+    /**
+     * Execute a parametric privileged action with the given parameter with the given context.
+     *
+     * @param action the action to execute
+     * @param parameter the parameter to send in to the action
+     * @param accessControlContext the context to use
+     * @param <T> the action result type
+     * @param <P> the parameter type
+     * @return the action result
+     */
+    @SuppressWarnings("unchecked")
+    public static <T, P> T doPrivilegedWithParameter(ParametricPrivilegedExceptionAction<T, P> action, P parameter, AccessControlContext accessControlContext) throws PrivilegedActionException {
+        final Context ctx = CTX.get();
+        ctx.action2 = (ParametricPrivilegedExceptionAction<Object, Object>) action;
+        ctx.parameter = parameter;
+        ctx.entered = true;
+        final AccessControlContext combined;
+        try {
+            ProtectionDomain[] protectionDomainStack = getProtectionDomainStack(accessControlContext);
+            if (protectionDomainStack == null || protectionDomainStack.length == 0) {
+                combined = ACC_CACHE.get(getCallerClass(2));
+            } else {
+                final ProtectionDomain[] finalDomains = Arrays.copyOf(protectionDomainStack, protectionDomainStack.length + 1);
+                finalDomains[protectionDomainStack.length] = getCallerClass(2).getProtectionDomain();
+                combined = new AccessControlContext(finalDomains);
+            }
+        } finally {
+            ctx.entered = false;
+        }
+        return (T) doPrivileged(PA_TRAMPOLINE1, combined);
     }
 }
